@@ -4,7 +4,7 @@
   "description": "Claude Code CLI wrapper that runs through a configured static proxy.",
   "type": "module",
   "bin": {
-    "claude-relay": "./src/cli.js"
+    "claude-relay": "./claude-relay"
   },
   "scripts": {
     "start": "node ./src/cli.js",

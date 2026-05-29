@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { spawn, execFileSync } from 'node:child_process';
 
 const NAME = 'claude-relay';
@@ -12,6 +13,10 @@ const CONFIG_DIR = path.join(realHome(), '.claude-relay');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const DEFAULT_NO_PROXY = 'localhost,127.0.0.1,::1,.local';
 const DEFAULT_CHECK_URL = 'https://api.anthropic.com';
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
+const INSTALL_LIB_DIR = path.join(CONFIG_DIR, 'lib');
+const INSTALL_LIB_FILE = path.join(INSTALL_LIB_DIR, 'cli.js');
+const PATH_MARKER = '# claude-relay path';
 
 function realHome() {
   const sudoUser = process.env.SUDO_USER;
@@ -120,6 +125,242 @@ function commandExists(command) {
   } catch {
     return false;
   }
+}
+
+function resolveShell() {
+  const sudoUser = process.env.SUDO_USER;
+  if (!sudoUser) {
+    return process.env.SHELL || '';
+  }
+
+  try {
+    if (process.platform === 'darwin') {
+      const output = execFileSync('dscl', ['.', '-read', `/Users/${sudoUser}`, 'UserShell'], {
+        encoding: 'utf8',
+        timeout: 2000
+      });
+      const match = output.match(/UserShell:\s*(\S+)/);
+      if (match) {
+        return match[1];
+      }
+    } else {
+      const output = execFileSync('getent', ['passwd', sudoUser], {
+        encoding: 'utf8',
+        timeout: 2000
+      });
+      return output.trim().split(':')[6] || process.env.SHELL || '';
+    }
+  } catch {
+    return process.env.SHELL || '';
+  }
+
+  return process.env.SHELL || '';
+}
+
+function isWritableDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function defaultInstallBinDir() {
+  const candidates = [
+    '/usr/local/bin',
+    path.join(realHome(), '.local', 'bin'),
+    path.join(realHome(), 'bin')
+  ];
+
+  for (const candidate of candidates) {
+    if (isWritableDir(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(`no writable bin directory found. Tried: ${candidates.join(', ')}`);
+}
+
+function installedBinInPath(binDir) {
+  return (process.env.PATH || '')
+    .split(path.delimiter)
+    .some((entry) => path.resolve(entry || '.') === path.resolve(binDir));
+}
+
+function detectShellRc() {
+  const home = realHome();
+  const shell = resolveShell();
+
+  if (shell.includes('zsh')) {
+    return { path: path.join(home, '.zshrc'), name: '~/.zshrc' };
+  }
+
+  if (shell.includes('bash')) {
+    const bashProfile = path.join(home, '.bash_profile');
+    if (process.platform === 'darwin' || fs.existsSync(bashProfile)) {
+      return { path: bashProfile, name: '~/.bash_profile' };
+    }
+    return { path: path.join(home, '.bashrc'), name: '~/.bashrc' };
+  }
+
+  return { path: path.join(home, '.profile'), name: '~/.profile' };
+}
+
+function ensurePathInShellRc(binDir) {
+  if (installedBinInPath(binDir)) {
+    return { changed: false, reason: 'already on PATH' };
+  }
+
+  const rc = detectShellRc();
+  const exportLine = `export PATH="${binDir}:$PATH"`;
+  const block = `\n${PATH_MARKER}\n${exportLine}\n`;
+
+  let content = '';
+  try {
+    content = fs.readFileSync(rc.path, 'utf8');
+  } catch {
+    content = '';
+  }
+
+  if (content.includes(exportLine) || content.includes(PATH_MARKER)) {
+    return { changed: false, rc, reason: 'already configured' };
+  }
+
+  fs.mkdirSync(path.dirname(rc.path), { recursive: true });
+  fs.appendFileSync(rc.path, block);
+  return { changed: true, rc, reason: 'updated' };
+}
+
+function writeInstalledWrapper(binFile, cliFile) {
+  const wrapper = `#!/usr/bin/env bash
+set -euo pipefail
+
+exec node ${JSON.stringify(cliFile)} "$@"
+`;
+  fs.writeFileSync(binFile, wrapper, { mode: 0o755 });
+}
+
+function installSelf(options = {}) {
+  const binDir = options['bin-dir'] ? path.resolve(options['bin-dir']) : defaultInstallBinDir();
+  const binFile = path.join(binDir, NAME);
+
+  if (options.proxy) {
+    proxySet(options.proxy);
+  }
+
+  if (fs.existsSync(binFile) && !options.force) {
+    throw new Error(`${binFile} already exists. Re-run with --force to overwrite.`);
+  }
+
+  fs.mkdirSync(INSTALL_LIB_DIR, { recursive: true });
+  if (path.resolve(SCRIPT_PATH) !== path.resolve(INSTALL_LIB_FILE)) {
+    fs.copyFileSync(SCRIPT_PATH, INSTALL_LIB_FILE);
+  }
+  fs.chmodSync(INSTALL_LIB_FILE, 0o755);
+
+  fs.mkdirSync(binDir, { recursive: true });
+  writeInstalledWrapper(binFile, INSTALL_LIB_FILE);
+
+  info(`installed ${NAME} to ${binFile}`);
+  info(`runtime copied to ${INSTALL_LIB_FILE}`);
+
+  if (!options['no-shell']) {
+    const pathResult = ensurePathInShellRc(binDir);
+    if (pathResult.changed) {
+      info(`added ${binDir} to PATH in ${pathResult.rc.name}`);
+      info(`reload your shell or run: source ${pathResult.rc.path}`);
+    } else if (!installedBinInPath(binDir) && pathResult.rc) {
+      info(`${binDir} is configured in ${pathResult.rc.name}; reload your shell if needed`);
+    } else if (installedBinInPath(binDir)) {
+      info(`${binDir} is already on PATH`);
+    }
+  }
+
+  if (options.proxy) {
+    info(`proxy config saved to ${CONFIG_FILE}`);
+  }
+}
+
+function proxyEnv() {
+  const proxyUrl = configuredProxy();
+  const env = { ...process.env };
+  if (!proxyUrl) {
+    return env;
+  }
+
+  env.HTTP_PROXY = proxyUrl;
+  env.HTTPS_PROXY = proxyUrl;
+  env.http_proxy = proxyUrl;
+  env.https_proxy = proxyUrl;
+  env.WS_PROXY = proxyUrl;
+  env.WSS_PROXY = proxyUrl;
+  env.NO_PROXY = DEFAULT_NO_PROXY;
+  env.no_proxy = DEFAULT_NO_PROXY;
+  return env;
+}
+
+function installClaudeCode(env, version = '') {
+  if (!commandExists('npm')) {
+    die('npm not found. Install Node.js/npm first.');
+  }
+
+  const packageName = version
+    ? `@anthropic-ai/claude-code@${version}`
+    : '@anthropic-ai/claude-code';
+  info(`installing ${packageName} ...`);
+
+  const child = spawn('npm', ['install', '-g', packageName], {
+    env,
+    stdio: 'inherit'
+  });
+  child.on('close', (code) => process.exit(code || 0));
+  child.on('error', (error) => die(error.message));
+}
+
+function updateClaudeCode(env) {
+  if (!commandExists('npm')) {
+    die('npm not found. Install Node.js/npm first.');
+  }
+
+  info('updating @anthropic-ai/claude-code to latest ...');
+  const child = spawn('npm', ['install', '-g', '@anthropic-ai/claude-code@latest'], {
+    env,
+    stdio: 'inherit'
+  });
+  child.on('close', (code) => process.exit(code || 0));
+  child.on('error', (error) => die(error.message));
+}
+
+function installCommand(options = {}) {
+  if (options.proxy) {
+    proxySet(options.proxy);
+  }
+
+  const env = proxyEnv();
+  if (options.update) {
+    updateClaudeCode(env);
+    return;
+  }
+
+  if (options.version) {
+    installClaudeCode(env, options.version);
+    return;
+  }
+
+  installSelf({ ...options, proxy: '' });
+
+  if (options['self-only']) {
+    return;
+  }
+
+  if (findClaude()) {
+    info(`claude already installed (${claudeVersion() || 'version unavailable'})`);
+    return;
+  }
+
+  installClaudeCode(env);
 }
 
 function proxySet(url) {
@@ -268,7 +509,7 @@ function parseOptions(argv) {
   const options = { _: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--url' || arg === '--timeout') {
+    if (arg === '--url' || arg === '--timeout' || arg === '--proxy' || arg === '--bin-dir' || arg === '--version') {
       if (!argv[i + 1]) {
         die(`${arg} requires a value`);
       }
@@ -278,6 +519,20 @@ function parseOptions(argv) {
       options.url = arg.slice('--url='.length);
     } else if (arg.startsWith('--timeout=')) {
       options.timeout = arg.slice('--timeout='.length);
+    } else if (arg.startsWith('--proxy=')) {
+      options.proxy = arg.slice('--proxy='.length);
+    } else if (arg.startsWith('--bin-dir=')) {
+      options['bin-dir'] = arg.slice('--bin-dir='.length);
+    } else if (arg.startsWith('--version=')) {
+      options.version = arg.slice('--version='.length);
+    } else if (arg === '--force') {
+      options.force = true;
+    } else if (arg === '--no-shell') {
+      options['no-shell'] = true;
+    } else if (arg === '--update') {
+      options.update = true;
+    } else if (arg === '--self-only') {
+      options['self-only'] = true;
     } else {
       options._.push(arg);
     }
@@ -298,6 +553,9 @@ Commands:
   proxy show                            Show proxy configuration
   proxy unset                           Clear proxy configuration
   proxy check [--url URL] [--timeout S] Check proxy, curl, and claude CLI
+  install [--proxy URL] [--bin-dir DIR] Install ${NAME} and Claude Code if needed
+  install --update                      Update Claude Code through configured proxy
+  install --version VERSION             Install a specific Claude Code npm version
   run <args...>                         Run claude with proxy env injected
   <args...>                             Any unknown command is passed to claude
   --version                             Show version
@@ -350,6 +608,10 @@ function main() {
       }
       break;
     }
+
+    case 'install':
+      installCommand(parseOptions(args));
+      break;
 
     case 'run':
       runClaude(args);
